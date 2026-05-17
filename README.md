@@ -213,51 +213,138 @@ db.toll_control_files.insertOne({
 
 ## Atlas Functions
 
-The two scripts under `atlas-functions/` are deployed inside MongoDB Atlas
-App Services. They are the only components that bridge between Atlas and
-the exporter; everything else flows on the exporter side.
+The two scripts under `atlas-functions/` are deployed as Atlas Functions
+attached to Database Triggers in the current Atlas UI. They are the only
+components that bridge between Atlas and the exporter; everything else
+flows on the exporter side.
 
 | File | Purpose | Wired to |
 |---|---|---|
-| `atlas-functions/simulate_segment_mode_changed.js` | Sends a synthetic (or change-stream-derived) **PL7055 / PL7087** event to `POST /internal/events/v1/segment-mode-changed`. HMAC-signs the body with `utils.crypto.hmac`. Includes a `buildPayloadFromChangeEvent` helper for switching from manual / scheduled invocation to a real Database Trigger handler. | Database Trigger on `segments` (update of `tollMode`) **or** a Scheduled Trigger for load testing. |
-| `atlas-functions/simulate_toll_control_file_registered.js` | Sends a synthetic (or change-stream-derived) **PL7093** event to `POST /internal/events/v1/toll-control-file-registered`. Same HMAC scheme. Includes the equivalent change-event helper. | Database Trigger on `toll_control_files` (insert) **or** Scheduled Trigger. |
+| `atlas-functions/simulate_segment_mode_changed.js` | Receives an **update** `changeEvent` from the `segments` collection, extracts the toll-mode transition (`prevDoc.tollMode` → `doc.tollMode`), HMAC-SHA256 signs the payload, and POSTs to `/internal/events/v1/segment-mode-changed`. Handles **PL7055** (REGULAR → MANDATORY) and **PL7087** (MANDATORY → REGULAR). | Database Trigger on `segments` (update of `tollMode`). |
+| `atlas-functions/simulate_toll_control_file_registered.js` | Receives an **insert** `changeEvent` from the `toll_control_files` collection, extracts `concession` + `fileId`, signs and POSTs to `/internal/events/v1/toll-control-file-registered`. Handles **PL7093**. | Database Trigger on `toll_control_files` (insert). |
 
-Both functions can be invoked three ways:
+Both functions throw on any non-2xx exporter response so Atlas retries per
+the trigger's retry policy; the exporter's `IdempotencyService` dedupes
+by the resume-token-based `eventId`, so retries are safe.
 
-1. **Manual `Run` from the Atlas Functions UI** — pass an `arg` object or
-   leave it empty (synthetic values are generated). Good for one-off
-   smoke tests against the deployed exporter.
-2. **Scheduled Trigger** — no argument; the function generates randomized
-   synthetic data. Good for load-ramping the receiver or exercising the
-   outbox path.
-3. **Database Trigger** — pass the `changeEvent`. In each file, swap
-   `buildSyntheticPayload(arg)` for the `buildPayloadFromChangeEvent(arg)`
-   helper at the bottom and configure the trigger as shown in the seed
-   script's comments.
+### Configuration (hardcoded for testing)
 
-### Configuration required in Atlas
+For the testing phase the three settings each function needs are inlined
+at the top of each `.js` file:
 
-Set up these in **App Services → Values & Secrets** before running either
-function:
+| Constant | Meaning |
+|---|---|
+| `EXPORTER_BASE_URL` | Where the function POSTs the event. For a tunneled local exporter, an `ngrok`-style URL; for the deployed service, the APIM base URL. |
+| `APIM_SUBSCRIPTION_KEY` | `Ocp-Apim-Subscription-Key` header value. Ignored by a directly-reached exporter; required when APIM gates the call. |
+| `HMAC_SHARED_SECRET` | Must match what the exporter resolves as `ExporterProperties.hmac.sharedSecret`. Defaults to `change-me-local-only` (matches `application.yml`'s local fallback). |
 
-| Name | Kind | Example / meaning |
-|---|---|---|
-| `exporterBaseUrl` | Value | `https://apim-eu-d-tsmng-01.azure-api.net/tsmng.cts.int/config/ms-tsmng-alarm-exporter` |
-| `apimSubscriptionKey` | Value | APIM subscription key for the exporter product |
-| `hmacSharedSecret` | Secret | The same string the exporter resolves into `ExporterProperties.hmac.sharedSecret` (Vault-backed in prod, `EXPORTER_HMAC_SECRET` env var locally) |
+Replace each `<PASTE …>` placeholder before running. **Do not commit real
+secrets** — move to a proper secret store before production.
 
 ### Wiring real Database Triggers
 
-| Trigger name | Collection | Op | Match expression |
-|---|---|---|---|
-| `pl7055_pl7087_segment_mode_changed` | `segments` | Update | `{ "updateDescription.updatedFields.tollMode": { "$exists": true } }` |
-| `pl7093_toll_control_file_registered` | `toll_control_files` | Insert | *(none — fire on every insert)* |
+| Trigger name | Collection | Op | Match expression | Full Document | Full Document Before |
+|---|---|---|---|---|---|
+| `pl7055_pl7087_segment_mode_changed` | `segments` | Update | `{ "updateDescription.updatedFields.tollMode": { "$exists": true } }` | `updateLookup` | `whenAvailable` |
+| `pl7093_toll_control_file_registered` | `toll_control_files` | Insert | *(none — fire on every insert)* | `updateLookup` | *(not needed)* |
 
-For the **Update** trigger also set:
-- **Full Document** = `updateLookup`
-- **Full Document Before Change** = `whenAvailable`
+The segment-mode trigger requires `fullDocumentBeforeChange` so the function
+can read the prior `tollMode`. Atlas enables `changeStreamPreAndPostImages`
+on the collection automatically when you tick the option.
 
-…so the function can compare old and new `tollMode`.
+### Testing from the Run console
+
+For testing without modifying real data, paste the synthetic `changeEvent`
+below into the Atlas Function's **Console** panel (bottom of the Function
+editor) and click Run. Each payload mirrors the exact shape a Database
+Trigger would deliver, so the function exercises the full guard → payload
+→ HMAC → POST chain identically.
+
+**PL7055 — segment enters Mandatory Mode (REGULAR → MANDATORY):**
+
+```javascript
+exports({
+  _id: { _data: "manual-test-" + Date.now() },
+  operationType: "update",
+  ns: { db: "tsmng-test", coll: "segments" },
+  documentKey: { _id: "fake-doc-id" },
+  fullDocument: {
+    concession: "DFW",
+    segmentId:  "S001",
+    tollMode:   "MANDATORY",
+    modifiedAt: new Date()
+  },
+  fullDocumentBeforeChange: {
+    concession: "DFW",
+    segmentId:  "S001",
+    tollMode:   "REGULAR",
+    modifiedAt: new Date(Date.now() - 60000)
+  },
+  updateDescription: {
+    updatedFields: { tollMode: "MANDATORY" }
+  }
+})
+```
+
+**PL7087 — segment leaves Mandatory Mode (MANDATORY → REGULAR):**
+
+```javascript
+exports({
+  _id: { _data: "manual-test-" + Date.now() },
+  operationType: "update",
+  ns: { db: "tsmng-test", coll: "segments" },
+  documentKey: { _id: "fake-doc-id" },
+  fullDocument: {
+    concession: "DFW",
+    segmentId:  "S003",
+    tollMode:   "REGULAR",
+    modifiedAt: new Date()
+  },
+  fullDocumentBeforeChange: {
+    concession: "DFW",
+    segmentId:  "S003",
+    tollMode:   "MANDATORY",
+    modifiedAt: new Date(Date.now() - 60000)
+  },
+  updateDescription: {
+    updatedFields: { tollMode: "REGULAR" }
+  }
+})
+```
+
+**PL7093 — new toll-control file registered (INSERT):**
+
+```javascript
+exports({
+  _id: { _data: "manual-test-" + Date.now() },
+  operationType: "insert",
+  ns: { db: "tsmng-test", coll: "toll_control_files" },
+  documentKey: { _id: "fake-doc-id" },
+  fullDocument: {
+    concession: "DFW",
+    fileId:     "TC-2026-05-18-001",
+    fileType:   "TC",
+    createdAt:  new Date()
+  }
+})
+```
+
+Expected log output on a successful Run:
+
+```
+segment-mode-changed: DFW/S001 REGULAR→MANDATORY → exporter 202 (eventId=manual-test-...)
+```
+
+…or for the toll-control file:
+
+```
+toll-control-file-registered: DFW/TC-2026-05-18-001 → exporter 202 (eventId=manual-test-...)
+```
+
+If you see `exporter rejected: 401` the HMAC didn't validate — most likely
+`HMAC_SHARED_SECRET` in the function doesn't match the value the exporter
+resolved. If you see `exporter rejected: 400` the payload is malformed —
+check the function logs for the body that was sent.
 
 ---
 

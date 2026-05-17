@@ -1,95 +1,141 @@
-/**
+A/**
  * simulate_toll_control_file_registered
  * ----------------------------------------------------------------------------
- * Sends a synthetic PL7093 event ("new toll-control file registered") to the
- * TSMNG alarm exporter, signed with the same HMAC scheme the real Atlas
- * Database Trigger will use.
+ * Atlas Database Trigger handler for new toll-control file registrations:
+ *   PL7093 — new toll-control file registered
  *
- * Modes of invocation
- * -------------------
- *   1. Manual "Run" from the Atlas Functions UI — pass an arg object via the
- *      Console panel, or leave it empty and dummy values will be generated.
- *        > exports({ concession: "DFW", fileId: "TC-2026-05-18-001" })
+ * Receives an INSERT `changeEvent` from the trigger, extracts the new
+ * document's identity fields, HMAC-SHA256 signs the payload, and POSTs to
+ * the TSMNG alarm exporter's webhook endpoint.
  *
- *   2. Scheduled Trigger — no argument is passed; the function generates a
- *      randomized synthetic fileId and POSTs it. Useful for end-to-end tests.
+ * Trigger configuration (Atlas UI → Triggers → Add Trigger)
+ * ---------------------------------------------------------
+ *   Operation Type:            Insert
+ *   Collection:                toll_control_files
+ *   Full Document:             updateLookup
+ *   Match Expression:          (none — fire on every insert)
+ *   Function:                  simulate_toll_control_file_registered
  *
- *   3. Database Trigger (insert-only on the toll-control collection) — the
- *      trigger passes a `changeEvent`. Replace `buildSyntheticPayload(arg)`
- *      below with `buildPayloadFromChangeEvent(arg)` (helper at the bottom).
+ * fullDocumentBeforeChange is NOT required — there is no prior state for
+ * an insert. The trigger only needs Full Document = updateLookup.
  *
- * Required Atlas Values
- * ---------------------
- *   exporterBaseUrl         e.g. https://apim-eu-d-tsmng-01.azure-api.net/tsmng.cts.int/config/ms-tsmng-alarm-exporter
- *   apimSubscriptionKey     APIM subscription key for the exporter product
+ * Test configuration (hardcoded — see CONFIG block below)
+ * -------------------------------------------------------
+ * For the testing phase the three settings the function needs are inlined
+ * at the top of this file instead of being read from Atlas Values & Secrets.
+ * Replace each <PLACEHOLDER> below with the value for your test target.
+ * Move to a proper secret store before production deployment.
  *
- * Required Atlas Secret
- * ---------------------
- *   hmacSharedSecret        same value the exporter resolves into
- *                           ExporterProperties.hmac.sharedSecret
+ * Retry semantics
+ * ---------------
+ * Throwing from this function causes Atlas to retry the invocation (up to
+ * its configured retry policy). We deliberately throw on any non-2xx
+ * response so transient exporter unavailability is replayed. The exporter's
+ * IdempotencyService dedupes by `eventId`, so retries are safe.
  */
-exports = async function (arg) {
-  const baseUrl = context.values.get("exporterBaseUrl");
-  const apimKey = context.values.get("apimSubscriptionKey");
-  const hmacKey = context.values.get("hmacSharedSecret");
 
-  const payload = buildSyntheticPayload(arg);
+// =========================================================================
+// TEST CONFIG (hardcoded). Do NOT commit real secrets.
+// =========================================================================
+//   EXPORTER_BASE_URL
+//     Where the function POSTs the event. Examples:
+//       - Tunneled local exporter:   https://abcd-1234.ngrok-free.app
+//       - Behind APIM (production):  https://apim-eu-d-tsmng-01.azure-api.net/tsmng.cts.int/config/ms-tsmng-alarm-exporter
+//   APIM_SUBSCRIPTION_KEY
+//     Ocp-Apim-Subscription-Key header. Ignored by a directly-reached
+//     exporter (no APIM in the path). Required when APIM gates the call.
+//   HMAC_SHARED_SECRET
+//     Must match what the exporter resolves as ExporterProperties.hmac.sharedSecret.
+//     The default below matches application.yml's local fallback so a
+//     locally-running exporter accepts the signature without further setup.
+// =========================================================================
+const EXPORTER_BASE_URL     = "<PASTE EXPORTER BASE URL HERE>";
+const APIM_SUBSCRIPTION_KEY = "<PASTE APIM SUBSCRIPTION KEY HERE>";
+const HMAC_SHARED_SECRET    = "change-me-local-only";
 
-  const body = JSON.stringify(payload);
-  const signature = utils.crypto.hmac(body, hmacKey, "sha256", "hex");
+exports = async function (changeEvent) {
+
+  // --------------------------------------------------------------------- //
+  // Guard 1: Database Triggers always pass a changeEvent. If invoked from //
+  // "Run" without one, exit cleanly.                                      //
+  // --------------------------------------------------------------------- //
+  if (!changeEvent) {
+    console.log("no changeEvent supplied (manual Run?) — skipping");
+    return { skipped: "no-change-event" };
+  }
+
+  // --------------------------------------------------------------------- //
+  // Guard 2: only act on inserts. PL7093 semantics: a *new* file just     //
+  // appeared. Updates / deletes / replaces are out of scope.              //
+  // --------------------------------------------------------------------- //
+  if (changeEvent.operationType !== "insert") {
+    console.log(`skipping operationType=${changeEvent.operationType} — only "insert" is in scope`);
+    return { skipped: "non-insert", operationType: changeEvent.operationType };
+  }
+
+  const doc = changeEvent.fullDocument || {};
+
+  // --------------------------------------------------------------------- //
+  // Guard 3: required fields. The exporter's DTO rejects blank/missing    //
+  // concession or fileId with 400 (@NotBlank); skip here with a clearer   //
+  // log so the trigger record shows *why* the event was dropped.          //
+  // --------------------------------------------------------------------- //
+  if (!doc.concession || !doc.fileId) {
+    console.warn(
+      `skipping — inserted doc missing required field(s) ` +
+      `(concession=${doc.concession}, fileId=${doc.fileId})`
+    );
+    return { skipped: "missing-required-fields", concession: doc.concession, fileId: doc.fileId };
+  }
+
+  // --------------------------------------------------------------------- //
+  // Build the payload. The exporter expects:                              //
+  //   eventId       string   — used for idempotency (resume-token based)  //
+  //   concession    string                                                //
+  //   fileId        string                                                //
+  //   occurredAt    ISO-8601 string with offset (parsed as ZonedDateTime) //
+  // --------------------------------------------------------------------- //
+  const payload = {
+    // changeEvent._id is the resume token; ._data is its stable string form.
+    eventId:    String(changeEvent._id && (changeEvent._id._data || changeEvent._id)),
+    concession: doc.concession,
+    fileId:     doc.fileId,
+    occurredAt: (doc.createdAt && doc.createdAt.toISOString())
+                || new Date().toISOString()
+  };
+
+  // --------------------------------------------------------------------- //
+  // Sign + POST.                                                          //
+  // The body string MUST be exactly the bytes we HMAC — JSON.stringify    //
+  // (NOT EJSON), and reuse the same `body` variable in both calls.        //
+  // --------------------------------------------------------------------- //
+  const body      = JSON.stringify(payload);
+  const signature = utils.crypto.hmac(body, HMAC_SHARED_SECRET, "sha256", "hex");
 
   const response = await context.http.post({
-    url: `${baseUrl}/internal/events/v1/toll-control-file-registered`,
+    url: `${EXPORTER_BASE_URL}/internal/events/v1/toll-control-file-registered`,
     headers: {
       "Content-Type":              ["application/json"],
       "X-Tsmng-Signature":         [signature],
-      "Ocp-Apim-Subscription-Key": [apimKey],
+      "Ocp-Apim-Subscription-Key": [APIM_SUBSCRIPTION_KEY],
       "X-Correlation-Id":          [payload.eventId]
     },
     body: body
   });
 
   const status = response.statusCode;
-  console.log(`toll-control-file-registered → exporter responded ${status} (eventId=${payload.eventId}, fileId=${payload.fileId})`);
+  console.log(
+    `toll-control-file-registered: ${payload.concession}/${payload.fileId} ` +
+    `→ exporter ${status} (eventId=${payload.eventId})`
+  );
 
   if (status >= 400) {
     const responseBody = response.body ? response.body.text() : "";
     console.error(`exporter rejected: ${status} ${responseBody}`);
+    // Throwing makes Atlas retry per its trigger retry policy.
+    // Safe — the exporter dedupes by eventId.
+    throw new Error(`exporter responded ${status}`);
   }
+
   return { statusCode: status, eventId: payload.eventId, payload: payload };
 };
-
-/* ------------------------------------------------------------------------- */
-
-function buildSyntheticPayload(arg) {
-  const a = arg || {};
-  const concessions = ["DFW", "I77", "I66"];
-  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-
-  return {
-    eventId:    a.eventId    || `sim-${BSON.UUID().toString()}`,
-    concession: a.concession || pick(concessions),
-    fileId:     a.fileId     || `TC-${today}-${String(randomInt(1, 999)).padStart(3, "0")}`,
-    occurredAt: new Date().toISOString()
-  };
-}
-
-function pick(arr)            { return arr[Math.floor(Math.random() * arr.length)]; }
-function randomInt(min, max)  { return Math.floor(Math.random() * (max - min + 1)) + min; }
-
-/* ------------------------------------------------------------------------- */
-/* Example shape for a real Database Trigger handler.                         */
-/* For PL7093 the trigger should be configured for inserts on the toll-       */
-/* control-file collection (no need for fullDocumentBeforeChange — there is   */
-/* no prior state for an insert).                                             */
-/* ------------------------------------------------------------------------- */
-// eslint-disable-next-line no-unused-vars
-function buildPayloadFromChangeEvent(changeEvent) {
-  const doc = changeEvent.fullDocument || {};
-  return {
-    eventId:    changeEvent._id._data, // Atlas resume token — unique per oplog entry
-    concession: doc.concession,
-    fileId:     doc.fileId || (doc._id && doc._id.toString()),
-    occurredAt: doc.createdAt ? doc.createdAt.toISOString() : new Date().toISOString()
-  };
-}
