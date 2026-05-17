@@ -1,0 +1,38 @@
+<configuration>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LoggingEventCompositeJsonEncoder">
+            <providers>
+                <timestamp>
+                    <timeZone>UTC</timeZone>
+                </timestamp>
+                <pattern>
+                    <pattern>
+                        {
+                        "level": "%level",
+                        "logger": "%logger",
+                        "thread": "%thread",
+                        "message": "%msg",
+                        "exception": "%ex{full}",
+                        "trace_id": "%mdc{trace_id}",
+                        "span_id": "%mdc{span_id}",
+                        "correlation_id": "%mdc{correlation_id}",
+                        "service.name": "${spring.application.name:-ms-tsmng-alarm-exporter}",
+                        "trace_flags": "%mdc{trace_flags}",
+                        "env": "${ENV:-dev}"
+                        }
+                    </pattern>
+                </pattern>
+            </providers>
+        </encoder>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+
+    <springProfile name="dev,local">
+        <logger name="com.cts" level="DEBUG"/>
+    </springProfile>
+
+</configuration>

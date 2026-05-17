@@ -1,0 +1,49 @@
+trigger:
+  batch: "true"
+  branches:
+    include:
+      - develop
+      # - release/*
+      # - hotfix/*
+
+parameters:
+  - name: concession
+    displayName: "Interstate Highway"
+    type: string
+    default: cts-core
+    values:
+      - cts-core
+  - name: run_tests
+    displayName: "Run with tests"
+    default: "true"
+    type: boolean
+  - name: run_kiuwan_tests
+    displayName: "Run Kiuwan Analysis"
+    default: "true"
+    type: boolean
+  - name: run_trivy_analysis
+    displayName: "Run Trivy Analysis"
+    default: "false"
+    type: boolean
+  - name: config_change
+    displayName: "Re-generate Helm chart"
+    default: false
+    type: boolean
+
+resources:
+  repositories:
+    - repository: _cicd
+      type: git
+      name: devops-pipelines
+      ref: refs/heads/feature/opentelemetry-colector
+
+extends:
+  template: pipelines-ext/tsmng-core/ms-pipeline-java.yml@_cicd
+  parameters:
+    msScope: "tsmng-core"
+    concession: ${{ parameters.concession }}
+    run_tests: ${{ parameters.run_tests }}
+    run_kiuwan_tests: ${{ parameters.run_kiuwan_tests }}
+    run_trivy_analysis: ${{ parameters.run_trivy_analysis }}
+    config_change: ${{ parameters.config_change }}
+    jdkVersion: "21"

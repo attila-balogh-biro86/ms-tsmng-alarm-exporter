@@ -1,0 +1,81 @@
+server:
+  port: 8080
+
+app:
+  default:
+    timezone: ${APP_TIMEZONE:UTC}
+
+spring:
+  application:
+    name: ms-tsmng-alarm-exporter
+  profiles:
+    default: dev
+  data:
+    mongodb:
+      # In production resolved from Vault via arc-starter-vault-config.
+      host: localhost
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+  info:
+    title: "TSMNG Alarm Exporter API"
+    description: "Webhook receivers for Atlas Database Trigger events and internal alarm pipeline endpoints."
+    version: "1.0.0"
+  paths-to-match:
+    - /**
+
+security:
+  cors:
+    allowed-origins: '*'
+    allowed-methods: '*'
+    allowed-headers: '*'
+    exposed-headers: '*'
+    allow-credentials: false
+
+logging:
+  level:
+    root: INFO
+    com.cts: INFO
+    io.opentelemetry: INFO
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      service: ms-tsmng-alarm-exporter
+      env: ${ENV:dev}
+
+# Exporter-specific configuration.
+# - concessions: tenants this exporter iterates for polling alarms (from TSMNG Alarms.xlsx Concession column).
+# - hmac: shared secret used to verify X-Tsmng-Signature on Atlas Trigger webhooks. Vault-backed in prod.
+# - outbox: persists accepted events before emission; drained by OutboxWorker.
+# - polling: cadences for the scheduled alarm runners; per-runner overrides via cadence.<name>.
+exporter:
+  concessions:
+    - DFW
+    - I77
+    - I66
+  hmac:
+    shared-secret: ${EXPORTER_HMAC_SECRET:change-me-local-only}
+    header-name: X-Tsmng-Signature
+  outbox:
+    enabled: true
+    retention: P7D
+    batch-size: 100
+    drain-interval: PT5S
+  polling:
+    enabled: true
+    default-cadence: PT10M
+    cadence:
+      freshness: PT10M
+      heartbeat: PT1M

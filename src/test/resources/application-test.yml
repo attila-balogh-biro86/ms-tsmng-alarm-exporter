@@ -1,0 +1,24 @@
+app:
+  default:
+    timezone: UTC
+
+spring:
+  cloud:
+    vault:
+      enabled: false
+  security:
+    enabled: false
+  data:
+    mongodb:
+      uri: mongodb://localhost:27017/testdb
+
+exporter:
+  concessions:
+    - DFW
+  hmac:
+    shared-secret: test-only-secret
+    header-name: X-Tsmng-Signature
+  outbox:
+    enabled: false
+  polling:
+    enabled: false
