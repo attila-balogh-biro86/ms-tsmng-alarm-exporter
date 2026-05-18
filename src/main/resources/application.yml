@@ -14,6 +14,12 @@ spring:
     mongodb:
       # In production resolved from Vault via arc-starter-vault-config.
       host: localhost
+      # Spring Boot 3 disables index auto-creation by default. We enable
+      # it because the exporter's only @Document classes are the internal
+      # _inbox and _inbox_seen collections — both start empty so the
+      # cost is negligible, and the unique + TTL indexes are required
+      # for the idempotency guarantee and the dedupe-store cleanup.
+      auto-index-creation: true
 
 springdoc:
   api-docs:
