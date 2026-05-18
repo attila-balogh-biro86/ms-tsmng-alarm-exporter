@@ -1,0 +1,47 @@
+server:
+  port: 8080
+
+spring:
+  # Vault is not running locally — disable both the property source and the
+  # autoconfig classes so startup doesn't try to fetch secrets from a Vault
+  # that isn't there.
+  cloud:
+    vault:
+      enabled: false
+  autoconfigure:
+    exclude:
+      - org.springframework.cloud.vault.config.VaultAutoConfiguration
+      - org.springframework.cloud.vault.config.VaultReactiveAutoConfiguration
+      - org.springframework.cloud.vault.config.VaultHealthIndicatorAutoConfiguration
+      - org.springframework.cloud.vault.config.VaultObservationAutoConfiguration
+      - org.springframework.cloud.vault.config.VaultReactiveObservationAutoConfiguration
+
+  data:
+    mongodb:
+      # Point at a local Mongo by default; override with SPRING_DATA_MONGODB_URI
+      # to use Atlas (or anything else) without editing this file.
+      uri: ${SPRING_DATA_MONGODB_URI:mongodb://localhost:27017/tsmng-local}
+
+management:
+  health:
+    # /actuator/health would otherwise red-light on Vault unavailability.
+    vault:
+      enabled: false
+
+# Exporter-specific overrides for local dev.
+#  - hmac.shared-secret: explicit local value, matches the Atlas Function's
+#    hardcoded HMAC_SHARED_SECRET so the signature validates without needing
+#    EXPORTER_HMAC_SECRET to be exported in the shell.
+#  - outbox.enabled: stays on so the /internal/events/** webhook path
+#    survives a restart — requires the local Mongo above to be running.
+#  - polling.enabled: OFF by default. The polling runners would otherwise
+#    query collections that may not be seeded yet; flip to `true` after
+#    running atlas-functions/seed_test_data.mongosh.js against your local
+#    Mongo.
+exporter:
+  hmac:
+    shared-secret: change-me-local-only
+  outbox:
+    enabled: true
+  polling:
+    enabled: false
